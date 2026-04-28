@@ -1,0 +1,428 @@
+# C++ DataModel & ServerModel Architecture — Engineering Prompt
+
+## Overview
+
+You are building a cross-platform C++ application targeting **Windows** (Win32/MSVC or MinGW) and **Android** (NDK/CMake). The architecture is a **hierarchical DataModel** system inspired by Roblox's engine, combined with a **ServerModel** that bridges to a remote multiplayer backend via HTTP. Below is every layer explained with implementation details.
+
+---
+
+## 1. DataModel Pointer
+
+The `DataModel` is the **root singleton** of your engine. It owns all top-level services via `std::shared_ptr` and is accessed globally through a raw or smart pointer.
+
+```cpp
+// DataModel.hpp
+#pragma once
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+class Instance;
+class Game;
+class Players;
+class ExampleService;
+
+class DataModel {
+public:
+    static DataModel* Get();          // Singleton accessor
+    void Init();
+    void Destroy();
+
+    std::shared_ptr<Game>          game;
+    std::shared_ptr<Players>       players;
+    std::shared_ptr<ExampleService> exampleService;
+
+private:
+    static DataModel* s_instance;
+    DataModel() = default;
+};
+```
+
+```cpp
+// DataModel.cpp
+#include "DataModel.hpp"
+#include "Game.hpp"
+#include "Players.hpp"
+#include "ExampleService.hpp"
+
+DataModel* DataModel::s_instance = nullptr;
+
+DataModel* DataModel::Get() {
+    if (!s_instance) s_instance = new DataModel();
+    return s_instance;
+}
+
+void DataModel::Init() {
+    game          = std::make_shared<Game>();
+    players       = std::make_shared<Players>();
+    exampleService = std::make_shared<ExampleService>();
+}
+```
+
+**Usage:**
+```cpp
+DataModel* DM = DataModel::Get();
+DM->Init();
+DM->players->AddPlayer("Player1");
+```
+
+---
+
+## 2. DataModel > Game
+
+```cpp
+// Game.hpp
+#pragma once
+#include <string>
+
+class Game {
+public:
+    std::string name    = "MyGame";
+    int         version = 1;
+
+    void Load();
+    void Unload();
+};
+```
+
+---
+
+## 3. DataModel > Players
+
+```cpp
+// Players.hpp
+#pragma once
+#include <vector>
+#include <string>
+
+struct Player {
+    std::string name;
+    int         userId;
+    float       x, y, z;   // position
+};
+
+class Players {
+public:
+    void                     AddPlayer(const std::string& name, int id = 0);
+    void                     RemovePlayer(int id);
+    Player*                  GetPlayerById(int id);
+    const std::vector<Player>& GetAll() const { return m_players; }
+
+private:
+    std::vector<Player> m_players;
+    int                 m_nextId = 1;
+};
+```
+
+---
+
+## 4. DataModel > ExampleService
+
+```cpp
+// ExampleService.hpp
+#pragma once
+
+class ExampleService {
+public:
+    void DoSomething();
+    int  GetStatus() const { return m_status; }
+
+private:
+    int m_status = 0;
+};
+```
+
+---
+
+## 5. ServerModelDataPointer
+
+The `ServerModel` is a **second root pointer** that lives alongside `DataModel`. It owns server-side services and the network Handle. Think of it as the "server-only" layer.
+
+```cpp
+// ServerModel.hpp
+#pragma once
+#include <memory>
+
+class ServerStorage;
+class ServerScriptService;
+class NetworkHandle;
+
+class ServerModel {
+public:
+    static ServerModel* Get();
+    void Init();
+
+    std::shared_ptr<ServerStorage>      serverStorage;
+    std::shared_ptr<ServerScriptService> serverScriptService;
+    std::shared_ptr<NetworkHandle>      handle;
+
+private:
+    static ServerModel* s_instance;
+    ServerModel() = default;
+};
+```
+
+---
+
+## 6. ServerModel > ServerStorage
+
+```cpp
+// ServerStorage.hpp
+#pragma once
+#include <unordered_map>
+#include <string>
+#include <any>
+
+class ServerStorage {
+public:
+    void        Set(const std::string& key, std::any value);
+    std::any    Get(const std::string& key) const;
+    bool        Has(const std::string& key) const;
+
+private:
+    std::unordered_map<std::string, std::any> m_data;
+};
+```
+
+---
+
+## 7. ServerModel > ServerScriptService
+
+```cpp
+// ServerScriptService.hpp
+#pragma once
+#include <functional>
+#include <unordered_map>
+#include <string>
+
+using ScriptFn = std::function<void()>;
+
+class ServerScriptService {
+public:
+    void RegisterScript(const std::string& name, ScriptFn fn);
+    void RunScript(const std::string& name);
+
+private:
+    std::unordered_map<std::string, ScriptFn> m_scripts;
+};
+```
+
+---
+
+## 8. ServerModel > Handle (NetworkHandle)
+
+The `NetworkHandle` wraps HTTP calls to your Vercel backend. Use **libcurl** (works on both Windows and Android NDK).
+
+```cpp
+// NetworkHandle.hpp
+#pragma once
+#include <string>
+#include <functional>
+
+struct PlayerPacketData {
+    std::string user;
+    float x, y, z;
+    // extend with any extra fields
+};
+
+using ResponseCallback = std::function<void(int httpCode, const std::string& body)>;
+
+class NetworkHandle {
+public:
+    static const std::string BASE_URL; // "https://multiplayer-weld-nu.vercel.app"
+
+    // Connect — POST /  (handshake)
+    void Connect(ResponseCallback cb);
+
+    // PlayerPacket — POST /Packet  { user, vector, etc. }
+    void PlayerPacket(const PlayerPacketData& data, ResponseCallback cb);
+
+    // TriggerBan — POST /Ban  { user }
+    void TriggerBan(const std::string& user, ResponseCallback cb);
+
+private:
+    std::string Post(const std::string& url, const std::string& jsonBody);
+    std::string Get(const std::string& url);
+};
+```
+
+```cpp
+// NetworkHandle.cpp
+#include "NetworkHandle.hpp"
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>   // nlohmann/json single-header
+
+using json = nlohmann::json;
+
+const std::string NetworkHandle::BASE_URL = "https://multiplayer-weld-nu.vercel.app";
+
+// libcurl write callback
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
+    s->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+std::string NetworkHandle::Post(const std::string& url, const std::string& body) {
+    CURL* curl = curl_easy_init();
+    std::string response;
+    if (curl) {
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     headers);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &response);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_perform(curl);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    }
+    return response;
+}
+
+void NetworkHandle::Connect(ResponseCallback cb) {
+    std::string res = Post(BASE_URL + "/", "{}");
+    cb(200, res);
+}
+
+void NetworkHandle::PlayerPacket(const PlayerPacketData& data, ResponseCallback cb) {
+    json body;
+    body["user"]   = data.user;
+    body["vector"] = { data.x, data.y, data.z };
+    std::string res = Post(BASE_URL + "/Packet", body.dump());
+    cb(200, res);
+}
+
+void NetworkHandle::TriggerBan(const std::string& user, ResponseCallback cb) {
+    json body;
+    body["user"] = user;
+    std::string res = Post(BASE_URL + "/Ban", body.dump());
+    cb(200, res);
+}
+```
+
+---
+
+## 9. Full Initialization Flow
+
+```cpp
+// main.cpp (or your app entry on both platforms)
+#include "DataModel.hpp"
+#include "ServerModel.hpp"
+
+void AppInit() {
+    // Boot DataModel
+    DataModel* DM = DataModel::Get();
+    DM->Init();
+
+    // Boot ServerModel
+    ServerModel* SM = ServerModel::Get();
+    SM->Init();
+
+    // Connect to multiplayer backend
+    SM->handle->Connect([](int code, const std::string& body) {
+        printf("[Connect] %d — %s\n", code, body.c_str());
+    });
+
+    // Send player packet
+    PlayerPacketData packet { "Player1", 10.f, 0.f, 5.f };
+    SM->handle->PlayerPacket(packet, [](int code, const std::string& body) {
+        printf("[Packet] %d — %s\n", code, body.c_str());
+    });
+}
+```
+
+---
+
+## 10. CMakeLists.txt (Cross-Platform)
+
+```cmake
+cmake_minimum_required(VERSION 3.22)
+project(MyEngine CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+
+# Sources
+file(GLOB_RECURSE SOURCES "src/*.cpp")
+add_executable(MyEngine ${SOURCES})
+
+# Includes
+target_include_directories(MyEngine PRIVATE include)
+
+# libcurl
+find_package(CURL REQUIRED)
+target_link_libraries(MyEngine PRIVATE CURL::libcurl)
+
+# nlohmann/json (header-only, put json.hpp in include/)
+# No extra linking needed
+
+# Android-specific
+if(ANDROID)
+    target_link_libraries(MyEngine PRIVATE log android)
+endif()
+```
+
+---
+
+## 11. Android NDK Notes
+
+- Place your C++ under `app/src/main/cpp/`
+- In `CMakeLists.txt` (Android), add `add_library(MyEngine SHARED ...)` instead of `add_executable`
+- Bundle `libcurl` as a prebuilt `.a` for Android (use `curl-android` from GitHub)
+- Call `AppInit()` from JNI:
+
+```cpp
+extern "C" JNIEXPORT void JNICALL
+Java_com_yourapp_MainActivity_nativeInit(JNIEnv*, jobject) {
+    AppInit();
+}
+```
+
+---
+
+## 12. Architecture Diagram
+
+```
+DataModel*
+├── Game
+├── Players
+│     └── Player { name, userId, x, y, z }
+└── ExampleService
+
+ServerModel*
+├── ServerStorage      (key-value store)
+├── ServerScriptService (named script registry)
+└── NetworkHandle
+      ├── Connect()       → POST /
+      ├── PlayerPacket()  → POST /Packet
+      └── TriggerBan()    → POST /Ban
+```
+
+---
+
+## Dependencies Summary
+
+| Library | Purpose | Platform |
+|---|---|---|
+| `libcurl` | HTTP requests | Windows + Android |
+| `nlohmann/json` | JSON serialization | Windows + Android |
+| `Android NDK r25+` | Native Android build | Android only |
+| `MSVC / MinGW` | Windows build | Windows only |
+
+---
+
+## Extending the Handle
+
+To add more endpoints, just add a method to `NetworkHandle`:
+
+```cpp
+// Example: POST /Event { name, data }
+void FireEvent(const std::string& eventName, const json& payload, ResponseCallback cb);
+```
+
+This keeps the pointer chain clean:
+```
+ServerModel → Handle → FireEvent(...)
+```
+
