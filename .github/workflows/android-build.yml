@@ -1,0 +1,30 @@
+name: Android Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+        cache: gradle
+
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+      # Note: gradlew might be in the root if you ran gradle init there, 
+      # or you might need to use the one in App/ if it's there.
+      # Based on previous steps, I should check if gradlew exists.
+
+    - name: Build with Gradle
+      run: ./gradlew assembleDebug
